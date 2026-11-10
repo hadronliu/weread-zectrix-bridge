@@ -1,0 +1,10 @@
+/target/
+/dist/
+.env
+*.log
+.DS_Store
+browser-controller/node_modules/
+browser-controller/.user-data/
+browser-controller/.last-*
+browser-controller/.reader-dom.html
+browser-controller/ink-preview.png

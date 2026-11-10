@@ -1,0 +1,16 @@
+{
+  "name": "weread-browser-controller",
+  "version": "1.0.0",
+  "private": true,
+  "description": "微信读书网页版 400×300 墨水屏排版净化、翻页与截屏控制器（Playwright，供 weread-zectrix-bridge 调用）",
+  "main": "controller.js",
+  "scripts": {
+    "start": "node controller.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

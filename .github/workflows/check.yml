@@ -1,0 +1,19 @@
+name: source-check
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: browser-controller/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci --prefix browser-controller
+      - run: node --check browser-controller/controller.js && node --check browser-controller/ink.js
+      - run: bash -n scripts/setup.sh scripts/start.sh scripts/package.sh
+      - run: cargo check --locked
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
