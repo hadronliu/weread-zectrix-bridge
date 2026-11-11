@@ -48,7 +48,7 @@ bash scripts/start.sh
 | 配置 | 默认 | 含义 |
 | --- | --- | --- |
 | ZECTRIX_IP | 必填 | 设备 IPv4 地址 |
-| ZECTRIX_FORMAT | mono | mono、gray4、gray16 |
+| ZECTRIX_FORMAT | gray4 | mono、gray4、gray16 |
 | WEREAD_INK_BLACK_POINT | 200 | 灰度黑点，0 关闭，范围 0 ≤ 值 < 250 |
 | ZECTRIX_PREFETCH | 0 | 1 开启下一页预取，可能使云端记录领先设备一页 |
 

@@ -56,20 +56,20 @@ fn usage() -> String {
     format!(
         "用法：weread-zectrix-bridge --ip <设备 IP> [选项]\n\
          \x20 --ip <addr>            极趣设备 IPv4 地址（必填，不扫描其他设备）\n\
-         \x20 --format <fmt>         图像格式 mono|gray4|gray16，默认 mono\n\
+         \x20 --format <fmt>         图像格式 mono|gray4|gray16，默认 gray4\n\
          \x20 --delay-ms <n>         翻页后等待重绘的毫秒数，默认 200\n\
          \x20 --font-level <n>       微信读书字号档位（1~6），默认 4；0 为沿用账号设置\n\
          \x20 --font-size <px>       正文强制像素字号（覆盖档位，慎用），默认 0 不覆盖\n\
          \x20 --no-prefetch          关闭下一页预渲染缓存\n\
          \x20 --node-bin <path>      node 可执行文件路径，默认取 PATH 中的 node\n\
          \x20 --controller <path>    controller.js 路径，默认随本工程分发\n\
-         示例：CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo run -- --ip 192.168.1.100 --format mono"
+         示例：CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo run -- --ip 192.168.1.100 --format gray4"
     )
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut ip: Option<String> = None;
-    let mut format = ImageFormat::Mono;
+    let mut format = ImageFormat::Gray4;
     let mut delay_ms: u64 = 200;
     let mut font_size: u32 = 0;
     let mut font_level: u32 = 4;
