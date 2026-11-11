@@ -3,6 +3,7 @@
 .env
 *.log
 .DS_Store
+settings.json
 browser-controller/node_modules/
 browser-controller/.user-data/
 browser-controller/.last-*

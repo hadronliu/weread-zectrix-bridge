@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微信读书 × 极趣墨水屏 · 管理页</title>
+<style>
+  :root {
+    --bg: #f4f1ea; --card: #ffffff; --ink: #1a1a1a; --muted: #8a8578;
+    --accent: #2f6f4f; --accent-ink: #ffffff; --warn: #b3541e; --ok: #2f6f4f;
+    --line: #e3ded2; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+    padding: 14px 20px; background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 16px; margin: 0 16px 0 0; }
+  .pill {
+    padding: 2px 10px; border-radius: 999px; font-size: 12px;
+    background: #eee9dd; color: var(--muted); white-space: nowrap;
+  }
+  .pill.on { background: #e2efe7; color: var(--ok); }
+  .pill.off { background: #f6e8dc; color: var(--warn); }
+  main {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+    max-width: 980px; margin: 16px auto; padding: 0 16px;
+  }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+  section {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px 16px;
+  }
+  section h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+  button {
+    font: inherit; border: 1px solid var(--line); background: #faf8f2; color: var(--ink);
+    border-radius: 8px; padding: 6px 14px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); color: var(--accent-ink); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  ul.books { list-style: none; margin: 10px 0; padding: 0; }
+  ul.books li {
+    display: flex; gap: 8px; align-items: center; justify-content: space-between;
+    padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px;
+  }
+  ul.books li.current { border-color: var(--accent); background: #f2f7f3; }
+  ul.books .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  ul.books small { color: var(--muted); display: block; overflow: hidden; text-overflow: ellipsis; }
+  .preview { display: block; width: 100%; max-width: 400px; aspect-ratio: 4 / 3;
+    background: #fff; border: 1px solid var(--line); border-radius: 8px; image-rendering: auto; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  #feedback { min-height: 22px; font-size: 13px; margin-top: 10px; }
+  #feedback.err { color: var(--warn); }
+  #feedback.ok { color: var(--ok); }
+  label.set { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+  select, input[type=number], input[type=text] {
+    font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: #fff; color: var(--ink);
+  }
+  input[type=text] { flex: 1; min-width: 0; }
+  .state-active { color: var(--ok); } .state-paused, .state-loading { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>微信读书 × 极趣墨水屏</h1>
+  <span class="pill" id="pill-browser" title="浏览器适配器">浏览器 · 检测中</span>
+  <span class="pill" id="pill-device" title="设备连接">设备 · 检测中</span>
+  <span class="pill" id="pill-auth" title="微信读书登录">登录 · 检测中</span>
+  <span class="pill" id="pill-session" title="投送会话">未投送</span>
+</header>
+
+<main>
+  <section>
+    <h2>选书与投送</h2>
+    <div class="row">
+      <button id="btn-library">打开书架 / 登录</button>
+      <button id="btn-refresh-candidates">刷新候选</button>
+    </div>
+    <p class="note">在弹出的浏览页里选书打开正文后，候选列表会自动出现；选中后点「投送此书」。也可以直接粘贴阅读链接。</p>
+    <ul class="books" id="candidates"></ul>
+    <div class="row">
+      <input type="text" id="cast-url" placeholder="https://weread.qq.com/web/reader/…">
+      <button class="primary" id="btn-cast-url">投送此链接</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>设备 · 当前投送</h2>
+    <div id="device-book" class="note">尚未投送书籍</div>
+    <img id="preview" class="preview" alt="设备画面预览（最近一次确认推送）" hidden>
+    <div class="row" style="margin-top:10px">
+      <button id="btn-prev">上一页</button>
+      <button id="btn-next">下一页</button>
+      <button id="btn-refresh">刷新画面</button>
+      <button id="btn-pause">暂停</button>
+      <button id="btn-resume">恢复</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btn-reconnect">重连设备</button>
+      <button id="btn-restart-browser">重启浏览器</button>
+    </div>
+    <div id="feedback"></div>
+    <p class="note">预览为最近一次「设备已确认」的推送画面，不是设备屏幕实时回读。设备上的物理上下键与确认键同样可用。</p>
+  </section>
+
+  <section style="grid-column: 1 / -1">
+    <h2>设置（即时生效并持久化）</h2>
+    <div class="row">
+      <label class="set">输出格式
+        <select id="set-format">
+          <option value="gray4">gray4（默认，四级灰阶）</option>
+          <option value="mono">mono（纯黑白，最快）</option>
+          <option value="gray16">gray16（十六级灰阶）</option>
+        </select>
+      </label>
+      <label class="set">黑点
+        <input type="number" id="set-black-point" min="0" max="249" step="5" style="width:80px">
+        <span class="note">0 为保留原图</span>
+      </label>
+      <label class="set">翻页等待 ms
+        <input type="number" id="set-delay" min="0" max="5000" step="50" style="width:90px">
+      </label>
+      <button id="btn-save-settings">保存设置</button>
+    </div>
+    <p class="note">字号请在微信读书浏览页的设置面板中调整（账号级持久）。预取默认关闭，避免浏览器提前翻页推进云端进度。</p>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+let lastState = null;
+
+function feedback(text, kind) {
+  const el = $('feedback');
+  el.textContent = text || '';
+  el.className = kind || '';
+}
+
+function setPill(id, on, text) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = 'pill ' + (on ? 'on' : 'off');
+}
+
+async function api(path, body) {
+  const opts = body === undefined
+    ? {}
+    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({ ok: false, error: '响应解析失败' }));
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.error || ('HTTP ' + res.status));
+  }
+  return data;
+}
+
+function renderState(st) {
+  lastState = st;
+  setPill('pill-browser', st.browser.alive,
+    '浏览器 · ' + (st.browser.alive ? (st.browser.mode || '运行中') : '未运行（点「重启浏览器」）'));
+  setPill('pill-device', st.device.connected,
+    '设备 · ' + (st.device.connected ? (st.device.desc || '已连接') : '未连接'));
+  setPill('pill-auth', st.auth.loggedIn === true,
+    '登录 · ' + (st.auth.loggedIn === true ? '已登录' : st.auth.loggedIn === false ? '未登录' : '检测中'));
+
+  const session = st.session;
+  if (session) {
+    const stateText = { active: '阅读中', paused: '已暂停', loading: '加载中' }[session.state] || session.state;
+    setPill('pill-session', session.state === 'active', '会话 #' + session.id + ' · ' + stateText);
+    $('device-book').innerHTML = '当前投送：<b></b><span class="note"></span>';
+    $('device-book').querySelector('b').textContent = session.title;
+    $('device-book').querySelector('span').textContent =
+      (session.error ? '（' + session.error + '）' : '') + ' ' + session.url;
+    $('device-book').className = session.state;
+    $('btn-pause').disabled = session.state !== 'active';
+    $('btn-resume').disabled = session.state === 'active' || session.state === 'loading';
+  } else {
+    setPill('pill-session', false, '未投送');
+    $('device-book').textContent = '尚未投送书籍（选书后点「投送此书」）';
+    $('device-book').className = 'note';
+    $('btn-pause').disabled = true;
+    $('btn-resume').disabled = true;
+  }
+  const busy = session && session.state === 'loading';
+  for (const id of ['btn-cast-url', 'btn-next', 'btn-prev', 'btn-refresh']) $(id).disabled = busy;
+
+  // 候选列表
+  const list = $('candidates');
+  list.innerHTML = '';
+  const currentUrl = session ? session.url : '';
+  for (const c of st.candidates) {
+    if (c.url === currentUrl) continue;
+    const li = document.createElement('li');
+    const div = document.createElement('div');
+    div.style.minWidth = '0';
+    div.style.flex = '1';
+    const t = document.createElement('div');
+    t.className = 'title';
+    t.textContent = c.title;
+    const s = document.createElement('small');
+    s.textContent = c.url;
+    div.append(t, s);
+    const btn = document.createElement('button');
+    btn.className = 'primary';
+    btn.textContent = '投送此书';
+    btn.onclick = () => cast(c.url, c.title);
+    li.append(div, btn);
+    list.append(li);
+  }
+  if (!list.children.length) {
+    const li = document.createElement('li');
+    li.className = 'note';
+    li.style.border = 'none';
+    li.textContent = '暂无候选阅读标签——在浏览页打开一本书的正文后，这里会自动列出。';
+    list.append(li);
+  }
+
+  // 设置
+  if (document.activeElement !== $('set-format')) $('set-format').value = st.settings.format;
+  if (document.activeElement !== $('set-black-point')) $('set-black-point').value = st.settings.blackPoint;
+  if (document.activeElement !== $('set-delay')) $('set-delay').value = st.settings.delayMs;
+}
+
+function refreshPreview() {
+  const img = $('preview');
+  img.hidden = false;
+  img.src = '/api/preview?v=' + Date.now();
+}
+
+async function poll() {
+  try {
+    const data = await api('/api/state');
+    renderState(data.state);
+  } catch (e) {
+    setPill('pill-browser', false, '服务 · 不可达');
+  }
+}
+
+async function cast(url, title) {
+  feedback('正在加载' + (title ? '《' + title + '》' : '书籍') + '并发送首帧…', '');
+  try {
+    const data = await api('/api/cast', { url });
+    feedback('已投送：《' + (data.title || title || '未知') + '》', 'ok');
+    refreshPreview();
+  } catch (e) {
+    feedback('投送失败：' + e.message, 'err');
+  }
+  poll();
+}
+
+$('btn-library').onclick = async () => {
+  feedback('正在打开书架浏览页…', '');
+  try { await api('/api/library', {}); feedback('已打开浏览页（如未见窗口请查看 Mac 屏幕）', 'ok'); }
+  catch (e) { feedback(e.message, 'err'); }
+};
+$('btn-refresh-candidates').onclick = () => poll();
+$('btn-cast-url').onclick = () => cast($('cast-url').value.trim());
+$('btn-next').onclick = () => nav('next');
+$('btn-prev').onclick = () => nav('prev');
+$('btn-refresh').onclick = () => nav('refresh');
+$('btn-pause').onclick = async () => {
+  try { await api('/api/pause', {}); feedback('已暂停（设备与管理页翻页均停止）', 'ok'); } catch (e) { feedback(e.message, 'err'); }
+  poll();
+};
+$('btn-resume').onclick = async () => {
+  feedback('正在恢复并重新同步画面…', '');
+  try { await api('/api/resume', {}); feedback('已恢复', 'ok'); refreshPreview(); }
+  catch (e) { feedback(e.message, 'err'); }
+  poll();
+};
+$('btn-reconnect').onclick = async () => {
+  try { const d = await api('/api/device/reconnect', {}); feedback(d.message || '已发起重连', 'ok'); }
+  catch (e) { feedback(e.message, 'err'); }
+  poll();
+};
+$('btn-restart-browser').onclick = async () => {
+  feedback('正在重启浏览器适配器…', '');
+  try { await api('/api/browser/restart', {}); feedback('浏览器已重启，稍候自动恢复上次投送', 'ok'); }
+  catch (e) { feedback(e.message, 'err'); }
+  poll();
+};
+$('btn-save-settings').onclick = async () => {
+  const body = {
+    format: $('set-format').value,
+    blackPoint: Number($('set-black-point').value || 0),
+    delayMs: Number($('set-delay').value || 0),
+  };
+  try { await api('/api/settings', body); feedback('设置已保存', 'ok'); }
+  catch (e) { feedback(e.message, 'err'); }
+  poll();
+};
+
+async function nav(action) {
+  try {
+    await api('/api/navigation', { action });
+    refreshPreview();
+    feedback('', '');
+  } catch (e) { feedback(e.message, 'err'); }
+  poll();
+}
+
+poll();
+refreshPreview();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>

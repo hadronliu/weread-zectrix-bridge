@@ -2,22 +2,27 @@
 'use strict';
 
 /**
- * 微信读书（weread.qq.com）浏览器渲染与截屏控制器。
+ * 微信读书浏览器适配器 v2（协议 v2）。
  *
- * 由 Rust 桥接服务（weread-zectrix-bridge）作为子进程启动，通过 stdin/stdout 的
- * JSON Lines 协议通信：
+ * 由 Rust 会话管理器（weread-zectrix-bridge）作为子进程启动，通过 stdin/stdout
+ * 的 JSON Lines 协议通信。与 v1 的核心差异：
  *
- *   请求（Rust → Node）：{"id":1,"cmd":"CAPTURE"|"NEXT_PAGE"|"PREV_PAGE"|"REFRESH"}
- *   响应（Node → Rust）：{"id":1,"ok":true,"pngB64":"<400×300 PNG 的 Base64>"}
- *                        {"id":1,"ok":false,"error":"..."}
- *   事件（Node → Rust）：{"event":"ready","url":"..."}
- *                        {"event":"log","message":"..."}
- *                        {"event":"closed","reason":"..."}
+ * - 浏览页与渲染页分离：浏览页（约 1100×800）供用户正常登录、选书、浏览，
+ *   永不注入净化 CSS；渲染页（516×360、DPR=1）专供设备截图，只有它接受
+ *   翻页/截屏指令——不再“扫描第一个阅读标签”猜测目标。
+ * - 启动即上报 controller_ready（无需登录/选书）；登录状态与候选阅读标签
+ *   变化通过事件主动上报。
+ * - 响应为分类型结构（frame/status/ack），错误含 code/message/recoverable。
+ * - 浏览器模式 auto/chrome/chromium：auto 优先系统 Chrome，避免下载 Chromium。
  *
- * - 使用持久化 userDataDir 保存微信读书登录状态，首次运行请在弹出的浏览器窗口中
- *   扫码登录并进入书籍正文页，检测到阅读页后自动注入净化 CSS 并上报 ready。
- * - 视口固定 400×300、deviceScaleFactor=1，与 ZECTRIX Note 4 墨水屏 1:1 像素对齐。
- * - 截图做可调灰度拉伸，不做二值化/抖色，最终量化交由 SDK 处理。
+ * 请求（Rust → Node）：{"id":1,"cmd":"LOAD_BOOK","payload":{"url":"..."}}
+ * 响应（Node → Rust）：{"id":1,"ok":true,"result":{"kind":"frame","pngB64":"..."}}
+ *                      {"id":1,"ok":false,"error":{"code":"no_renderer","message":"…","recoverable":true}}
+ * 事件（Node → Rust）：controller_ready / auth_changed / candidates_changed /
+ *                      renderer_closed / log / closed
+ *
+ * 指令集：OPEN_LIBRARY、LIST_CANDIDATES、LOAD_BOOK、CAPTURE、NEXT_PAGE、
+ *         PREV_PAGE、REFRESH、CLOSE_RENDERER。
  */
 
 const fs = require('fs');
@@ -25,11 +30,6 @@ const path = require('path');
 const readline = require('readline');
 const { chromium } = require('playwright');
 const { enhanceInk } = require('./ink');
-// Set WEREAD_INK_BLACK_POINT=0 to retain the original screenshot.
-const INK_BLACK_POINT = Number(process.env.WEREAD_INK_BLACK_POINT ?? 200);
-if (!Number.isFinite(INK_BLACK_POINT) || INK_BLACK_POINT < 0 || INK_BLACK_POINT >= 250) {
-  throw new Error('WEREAD_INK_BLACK_POINT must be in [0, 250)');
-}
 
 // ---------------------------------------------------------------- 命令行参数
 
@@ -38,42 +38,35 @@ function argValue(name, fallback) {
   return i !== -1 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback;
 }
 
-/** 翻页后等待 DOM/Canvas 重绘稳定的毫秒数，与 Rust 端 --delay-ms 对应。 */
+/** 浏览器模式：auto（系统 Chrome 优先）/ chrome / chromium。 */
+const BROWSER_MODE = ['auto', 'chrome', 'chromium'].includes(argValue('--browser', 'auto'))
+  ? argValue('--browser', 'auto')
+  : 'auto';
+/** 翻页后等待重绘的默认毫秒数；单条指令可用 payload.delayMs 覆盖。 */
 const DELAY_MS = Math.max(0, parseInt(argValue('--delay-ms', '200'), 10) || 200);
 const START_URL = argValue('--url', 'https://weread.qq.com');
-/** 持久化会话目录：保存登录 Cookie 与浏览器状态。 */
+/** 服务专属持久化目录：保存登录 Cookie，不读日常 Chrome 用户目录。 */
 const PROFILE_DIR = argValue('--user-data-dir', path.join(__dirname, '.user-data'));
-/** 等待用户扫码登录并进入正文页的最长时间（首次运行较久）。 */
-const READY_TIMEOUT_MS = Math.max(
-  60_000,
-  parseInt(argValue('--ready-timeout-ms', String(15 * 60 * 1000)), 10) || 15 * 60 * 1000
-);
-
-/** ZECTRIX Note 4 物理分辨率：400×300，1:1 像素对齐。 */
-const VIEWPORT = { width: 400, height: 300 };
-// WeRead reserves 70px on each side even on small screens. Let its own
-// paginator lay out a wider page, then remove only the outer whitespace.
-// Keep 12px side margins and the chapter header; never resize canvas pixels.
-const READER_VIEWPORT = { width: 516, height: 360 };
-const CAPTURE_CLIP = { x: 58, y: 30, width: 400, height: 300 };
-
-/** 正文强制字号（px）；0 表示不覆盖（推荐用字号档位而非 px 覆盖）。 */
+/** 灰度拉伸黑点（0~249）；0 表示保留原始截图。单条指令可覆盖。 */
+const BLACK_POINT = (() => {
+  const n = Number(argValue('--black-point', process.env.WEREAD_INK_BLACK_POINT ?? '200'));
+  if (!Number.isFinite(n) || n < 0 || n >= 250) {
+    throw new Error('--black-point must be in [0, 250)');
+  }
+  return Math.floor(n);
+})();
+/** 正文强制字号（px）；0 表示不覆盖（推荐在微信读书设置里调字号）。 */
 const READER_FONT_SIZE = Math.max(0, parseInt(argValue('--font-size', '0'), 10) || 0);
+/** 诊断输出开关：WEREAD_DIAG=1 时刷新指令附带排版诊断日志。 */
+const DIAG = process.env.WEREAD_DIAG === '1';
 
 /**
- * 微信读书新版阅读器（wr_horizontalReader）的字号档位：body 上的
- * wr_reader_font_size_level_N class。0 表示沿用账号当前档位。
+ * 渲染页排版：微信读书按 516×360 分页后在中间裁出 400×300 设备画面，
+ * 保留约 12px 侧边距；浏览页用桌面尺寸正常浏览。
  */
-const READER_FONT_LEVEL = Math.max(0, parseInt(argValue('--font-level', '4'), 10) || 0);
-
-/** 触发微信读书重新分页后等待重排完成的毫秒数。 */
-const REPAGINATE_SETTLE_MS = Math.max(
-  300,
-  parseInt(argValue('--repaginate-ms', '900'), 10) || 900
-);
-
-/** 记住上次的阅读页 URL，重启后自动续读。 */
-const LAST_READER_FILE = path.join(__dirname, '.last-reader-url');
+const BROWSE_VIEWPORT = { width: 1100, height: 800 };
+const RENDERER_VIEWPORT = { width: 516, height: 360 };
+const CAPTURE_CLIP = { x: 58, y: 30, width: 400, height: 300 };
 
 // ---------------------------------------------------------------- 输出工具
 
@@ -85,20 +78,23 @@ function sendLog(message) {
   sendEvent('log', { message });
 }
 
-function sendReply(id, ok, fields = {}) {
-  process.stdout.write(JSON.stringify({ id, ok, ...fields }) + '\n');
+function sendReply(id, ok, extra = {}) {
+  process.stdout.write(JSON.stringify({ id, ok, ...extra }) + '\n');
+}
+
+function sendOk(id, result) {
+  sendReply(id, true, { result });
+}
+
+function sendErr(id, code, message, recoverable = true) {
+  sendReply(id, false, { error: { code, message, recoverable } });
 }
 
 /** 已进入主动关闭流程：后续异常不再按“启动失败”上报。 */
 let shuttingDown = false;
 
-// -------------------------------------------- 微信读书墨水屏排版净化 CSS
+// ---------------------------------------------------------------- 排版净化 CSS
 
-/**
- * 目标：隐藏顶部导航栏、左右悬浮工具栏、目录/笔记/设置等弹层与页脚，
- * 让正文铺满 400×300 视口，并强制纯白背景 / 纯黑文字以增强墨水屏对比度。
- * 微信读书分页由其 JS 按容器尺寸计算，注入后需触发 resize 让它重新分页。
- */
 function buildCleanupCss(fontSizePx) {
   const fontRule =
     fontSizePx > 0
@@ -121,12 +117,10 @@ function buildCleanupCss(fontSizePx) {
 .readerCopyright, .readerBarcode, .readerTranslate,
 .reading_background_jukebox, .jukebox, .readerSearchPanel,
 [class*="readerControls"], [class*="readerTopBar"],
-/* 新版阅读器“上一页/下一页”提示条：物理按键已承担翻页，腾出正文空间 */
 .renderTarget_pager { display: none !important; }
 
-/* 2) 阅读容器全幅铺满 400×300 视口：清零桌面版预留的边栏与上下留白。
-      注意：不要对新版阅读器的 wr_* 容器强制 height:100%——会破坏其内部
-      高度计算导致渲染容器塌陷（曾引发整页白屏）。 */
+/* 2) 阅读容器铺满视口。注意：不要对新版阅读器的 wr_* 容器强制
+      height:100% —— 会破坏其内部高度计算导致渲染容器塌陷（白屏）。 */
 html, body { margin: 0 !important; padding: 0 !important; width: 100% !important; height: 100% !important; }
 .readerContent, .readerContent .app_content,
 .readerChapterContent, .readerRestore, .readerRestore_1,
@@ -144,9 +138,7 @@ html, body { margin: 0 !important; padding: 0 !important; width: 100% !important
   bottom: 0 !important;
 }
 
-/* Cover/intro pages use 50px padding, unlike the canvas reader's 70px.
-   Align both to the same capture-safe area (58px crop + 12px margin).
-   Keep automatic height so long introductions can still paginate. */
+/* 封面/扉页与 canvas 阅读器的左右留白对齐到裁切安全区。 */
 .horizontalReaderCoverPage_content,
 .horizontalReaderCoverPage_content_right,
 .horizontalReaderCoverPage_content_additional,
@@ -160,9 +152,7 @@ html, body { margin: 0 !important; padding: 0 !important; width: 100% !important
   overflow-wrap: anywhere !important;
 }
 
-/* 3) 墨水屏对比度优化：纯白背景 + 纯黑文字。
-      微信读书会用低不透明度把正文调成浅灰（黑字×opacity≈灰字），
-      灰字经黑白量化+抖色后“发虚”——必须强制 opacity 归一。 */
+/* 3) 墨水屏对比度：纯白背景 + 纯黑文字（微信读书会把正文调成浅灰）。 */
 html, body,
 .readerContent, .app_content, .readerChapterContent,
 .readerRestore, .readerRestore_1, .readerContainer {
@@ -180,8 +170,7 @@ body *:not(svg):not(path):not(img):not(video) {
 html, body { overflow: hidden !important; }
 ::-webkit-scrollbar { display: none !important; }
 
-/* 5) 墨水屏清晰度：关闭字体抗锯齿与文字阴影，笔画边缘纯黑白，
-      mono 量化后不发虚（macOS Chromium 生效）。 */
+/* 5) 墨水屏清晰度：关闭字体抗锯齿与文字阴影。 */
 *, *::before, *::after {
   -webkit-font-smoothing: none !important;
   font-smooth: never !important;
@@ -191,13 +180,9 @@ ${fontRule}`;
 }
 
 const CLEANUP_CSS = buildCleanupCss(READER_FONT_SIZE);
-
 const CSS_STYLE_ID = 'weread-zectrix-clean-css';
 
-/**
- * 注入净化 CSS。幂等：默认仅在不存在的时机注入；force=true 时强制重写
- * （供确认键“重新注入美化 CSS”使用）。
- */
+/** 注入净化 CSS（仅渲染页调用）。幂等；force=true 强制重写。 */
 async function injectCss(page, force = false) {
   await page.evaluate(
     ([css, styleId, forced]) => {
@@ -213,11 +198,7 @@ async function injectCss(page, force = false) {
   );
 }
 
-/**
- * 等待两帧 requestAnimationFrame，确保截图前页面已完成重绘。
- * 有界等待：后台/被遮挡标签的 rAF 会被 Chromium 暂停，用 500ms 定时器兜底，
- * 避免永久挂起（曾导致截屏指令 30s 超时）。
- */
+/** 等待两帧 rAF（后台标签 rAF 会被暂停，用 500ms 定时器兜底）。 */
 async function settlePaint(page) {
   await page.evaluate(
     () =>
@@ -240,16 +221,29 @@ async function settlePaint(page) {
   );
 }
 
-function isReaderUrl(url) {
-  return typeof url === 'string' && url.includes('weread.qq.com') && url.includes('/web/reader');
+/** 阅读页 URL 判定：严格解析，不使用字符串 includes。 */
+function parseReaderUrl(raw) {
+  if (typeof raw !== 'string' || raw.length > 2048) return null;
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:' || u.hostname !== 'weread.qq.com') return null;
+  // 路径形如 /web/reader/<bookId>[/...]，bookId 必须非空。
+  const parts = u.pathname.split('/').filter(Boolean);
+  if (parts.length < 2 || parts[0] !== 'web' || parts[1] !== 'reader') return null;
+  const bookId = parts[2];
+  if (!bookId || /[?#]/.test(bookId)) return null;
+  return { url: u.origin + u.pathname + u.search, bookId };
 }
 
 /**
- * 等待阅读内容真正渲染：渲染容器高度非零且含可见文本。
- * 新版阅读器（renderTargetContainer）重渲染期间容器高度会暂时塌陷为 0，
- * 此时截图会得到白屏——就绪与刷新前必须等待。
+ * 等待阅读内容真实渲染：渲染容器高度非零且含可见文本。
+ * 重渲染期间容器会暂时塌陷为 0，此时截图会得到白屏。
  */
-async function waitForContent(page, timeoutMs = 8000) {
+async function waitForContent(page, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const ok = await page
@@ -265,128 +259,10 @@ async function waitForContent(page, timeoutMs = 8000) {
     if (ok) return true;
     await new Promise((r) => setTimeout(r, 300));
   }
-  sendLog('等待阅读内容渲染超时，继续执行（可能截到未完成的画面）');
   return false;
 }
 
-/**
- * 触发微信读书重新分页：派发 resize 事件并等待重排完成。
- * 注意：仅在确认键刷新时使用；启动时的自动触发曾导致渲染容器塌陷（白屏）。
- * 字号档位（wr_reader_font_size_level_N）是账号云端状态，重渲染会被同步
- * 覆盖，无法通过 DOM 修改——需在微信读书自己的设置面板中调整。
- */
-async function triggerRepagination(page) {
-  await page.evaluate(() => {
-    window.dispatchEvent(new Event('resize'));
-  });
-  await new Promise((r) => setTimeout(r, REPAGINATE_SETTLE_MS));
-}
-
-/**
- * 排版诊断：追踪正文文本节点的祖先链（transform/zoom/字号/盒尺寸/内边距），
- * 统计小字号元素，把结果打到日志，供精确校准 CSS。
- */
-async function reportDiagnostics(page) {
-  try {
-    const info = await page.evaluate(() => {
-      const out = {
-        viewport: [window.innerWidth, window.innerHeight],
-        chain: [],
-        smallFonts: [],
-        chapterRect: null,
-      };
-      const chap = document.querySelector('.readerChapterContent');
-      if (chap) {
-        const r = chap.getBoundingClientRect();
-        out.chapterRect = [Math.round(r.width), Math.round(r.height)];
-      }
-      // 找可见文本最多的元素作为正文代表
-      let best = null;
-      let bestLen = 0;
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let n;
-      while ((n = walker.nextNode())) {
-        const t = (n.textContent || '').trim();
-        if (t.length > bestLen && n.parentElement) {
-          const cs = getComputedStyle(n.parentElement);
-          if (cs.display !== 'none' && cs.visibility !== 'hidden') {
-            best = n.parentElement;
-            bestLen = t.length;
-          }
-        }
-      }
-      if (best) {
-        let el = best;
-        for (let depth = 0; el && depth < 14; depth++) {
-          const cs = getComputedStyle(el);
-          const cls = (el.getAttribute('class') || '').toString().slice(0, 70);
-          out.chain.push({
-            tag: el.tagName,
-            cls,
-            fontSize: cs.fontSize,
-            transform: cs.transform !== 'none' ? cs.transform.slice(0, 70) : 'none',
-            zoom: cs.zoom || '1',
-            rect: [
-              Math.round(el.getBoundingClientRect().width),
-              Math.round(el.getBoundingClientRect().height),
-            ],
-            padding: cs.padding,
-          });
-          el = el.parentElement;
-        }
-      }
-      // 小字号元素普查（≤15px 且含可见文本），新版阅读器根节点优先
-      const census = new Map();
-      const roots = document.querySelectorAll('.wr_horizontalReader, .readerContent');
-      roots.forEach((root) =>
-        root.querySelectorAll('*').forEach((el) => {
-          const cs = getComputedStyle(el);
-          if (
-            parseFloat(cs.fontSize) <= 15 &&
-            cs.display !== 'none' &&
-            (el.textContent || '').trim()
-          ) {
-            const key = `${el.tagName}.${(el.getAttribute('class') || '').split(' ')[0]}@${cs.fontSize}`;
-            census.set(key, (census.get(key) || 0) + 1);
-          }
-        })
-      );
-      out.smallFonts = [...census.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 8);
-      // 当前字号档位与翻页提示元素
-      out.fontLevel = (document.body.className.match(/wr_reader_font_size_level_\d+/) || ['none'])[0];
-      out.pageHints = [];
-      document.querySelectorAll('button, span, div, a').forEach((el) => {
-        const t = (el.textContent || '').trim();
-        if ((t === '上一页' || t === '下一页') && el.children.length <= 2) {
-          out.pageHints.push(`${el.tagName}.${(el.getAttribute('class') || '').slice(0, 50)}`);
-        }
-      });
-      // 渲染树转储：renderTargetContainer 下 3 层结构（定位页面盒留白的来源）
-      out.renderTree = [];
-      const rt = document.querySelector('.renderTargetContainer');
-      if (rt) {
-        const walk = (el, depth) => {
-          if (depth > 3 || out.renderTree.length > 24) return;
-          const cs = getComputedStyle(el);
-          const r = el.getBoundingClientRect();
-          out.renderTree.push(
-            `${'  '.repeat(depth)}${el.tagName}.${(el.getAttribute('class') || '').split(' ')[0].slice(0, 40)} ${Math.round(r.width)}x${Math.round(r.height)} pad:${cs.padding}`
-          );
-          for (const child of Array.from(el.children).slice(0, 6)) walk(child, depth + 1);
-        };
-        walk(rt, 0);
-      }
-      return out;
-    });
-    sendLog('排版诊断 ' + JSON.stringify(info));
-  } catch (e) {
-    sendLog('排版诊断失败：' + (e && e.message ? e.message : e));
-  }
-}
-
-/** 最近一次成功截屏的存档路径，供人工比对浏览器端原始画面。 */
+/** 最近一次成功截屏存档，供人工比对浏览器端原始画面。 */
 const LAST_CAPTURE_FILE = path.join(__dirname, '.last-capture.png');
 function archiveCapture(buf) {
   try {
@@ -398,25 +274,69 @@ function archiveCapture(buf) {
 
 // ---------------------------------------------------------------- 主流程
 
+async function launchContext() {
+  const common = {
+    headless: false,
+    // context 级默认视口（浏览页尺寸）与 DPR=1；渲染页用 setViewportSize
+    // 独立覆盖为 516×360——Playwright 不允许 viewport:null 时携带 deviceScaleFactor。
+    viewport: { width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height },
+    deviceScaleFactor: 1,
+    args: [
+      '--window-size=1180,900',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  };
+  // executablePath() 是同步 API：浏览器未下载时抛错。
+  let chromiumInstalled = true;
+  try {
+    chromium.executablePath();
+  } catch {
+    chromiumInstalled = false;
+  }
+
+  if (BROWSER_MODE === 'chromium') {
+    if (!chromiumInstalled) {
+      throw new Error(
+        'Playwright Chromium 未安装：请在 browser-controller 下运行 npx playwright install chromium，或使用 --browser auto/chrome'
+      );
+    }
+    return chromium.launchPersistentContext(PROFILE_DIR, common);
+  }
+  if (BROWSER_MODE === 'chrome') {
+    return chromium.launchPersistentContext(PROFILE_DIR, { ...common, channel: 'chrome' });
+  }
+  // auto：优先系统 Chrome（无需下载 Chromium），缺失时回退。
+  try {
+    const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+      ...common,
+      channel: 'chrome',
+    });
+    sendLog('使用系统 Chrome（专属会话目录，不影响日常浏览器数据）');
+    return ctx;
+  } catch (e) {
+    if (!chromiumInstalled) {
+      throw new Error(
+        '系统 Chrome 不可用且 Playwright Chromium 未安装：请安装 Google Chrome，或在 browser-controller 下运行 npx playwright install chromium。原始错误：' +
+          (e && e.message ? e.message : e)
+      );
+    }
+    sendLog('系统 Chrome 不可用，回退 Playwright Chromium：' + (e && e.message ? e.message : e));
+    return chromium.launchPersistentContext(PROFILE_DIR, common);
+  }
+}
+
 async function main() {
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
 
-  sendLog(`正在启动 Chromium（会话目录：${PROFILE_DIR}）…`);
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: false,
-    // 严格 400×300、1:1 像素，避免缩放导致文字边缘发虚。
-    viewport: READER_VIEWPORT,
-    deviceScaleFactor: 1,
-    args: ['--window-size=536,420', '--disable-blink-features=AutomationControlled'],
-  });
+  const context = await launchContext();
 
   let exiting = false;
-  let cssTimer = null;
+  let pollTimer = null;
   async function shutdown(reason) {
     if (exiting) return;
     exiting = true;
     shuttingDown = true;
-    if (cssTimer) clearInterval(cssTimer);
+    if (pollTimer) clearInterval(pollTimer);
     sendEvent('closed', reason ? { reason } : {});
     try {
       await context.close();
@@ -425,103 +345,233 @@ async function main() {
     }
     process.exit(0);
   }
-
-  // 用户直接关闭浏览器窗口 → 通知 Rust 端退出。
-  context.on('close', () => shutdown('browser-window-closed'));
-
-  /** 阅读页可能在任意标签页打开（微信读书会新开标签）：扫描全部标签。 */
-  function findReaderPage() {
-    return context.pages().find((p) => !p.isClosed() && isReaderUrl(p.url())) || null;
-  }
-
-  /** 指令目标标签：优先阅读页标签，否则退回主标签。 */
-  function targetPage() {
-    return findReaderPage() || page;
-  }
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  context.on('close', () => shutdown('browser-window-closed'));
 
-  // 复用已打开的微信读书标签页，否则新开并导航。
-  // 上次记录过阅读页则直接续读，免去手动找书打开。
-  let savedReaderUrl = '';
-  try {
-    savedReaderUrl = fs.existsSync(LAST_READER_FILE)
-      ? fs.readFileSync(LAST_READER_FILE, 'utf8').trim()
-      : '';
-  } catch {
-    savedReaderUrl = '';
+  // ---------------- 页面管理：浏览页 + 专用渲染页 ----------------
+
+  /** 浏览页：正常桌面视口，保留站点导航，永不注入净化 CSS。 */
+  let browsePage = context.pages().find((p) => !p.isClosed()) || (await context.newPage());
+  await browsePage.setViewportSize(BROWSE_VIEWPORT).catch(() => {});
+  if (!/weread\.qq\.com/.test(browsePage.url())) {
+    sendLog(`浏览页正在打开 ${START_URL} …`);
+    await browsePage
+      .goto(START_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+      .catch((e) => sendLog(`打开书架失败：${e && e.message ? e.message : e}`));
   }
-  const initialTarget =
-    savedReaderUrl && isReaderUrl(savedReaderUrl) ? savedReaderUrl : START_URL;
 
-  let page = context.pages().find((p) => /weread\.qq\.com/.test(p.url()));
-  if (!page) page = await context.newPage();
-  if (!/weread\.qq\.com/.test(page.url())) {
-    sendLog(`正在打开 ${initialTarget}${savedReaderUrl ? '（自动续读上次书籍）' : ''} …`);
-    await page
-      .goto(initialTarget, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-      .catch((e) => sendLog(`打开页面失败：${e && e.message ? e.message : e}`));
+  /** 渲染页：专用设备渲染目标；只有它接受翻页/截屏指令。 */
+  let rendererPage = null;
+
+  function ensureRenderer() {
+    return rendererPage && !rendererPage.isClosed() ? rendererPage : null;
   }
-  await page.bringToFront().catch(() => {});
 
-  // SPA 路由切换 / 章节跳转后可能重建 DOM，周期性幂等补注 CSS。
-  cssTimer = setInterval(() => {
+  async function createRenderer() {
+    const p = await context.newPage();
+    await p.setViewportSize(RENDERER_VIEWPORT).catch(() => {});
+    p.on('close', () => {
+      if (rendererPage === p) {
+        rendererPage = null;
+        sendEvent('renderer_closed', {});
+      }
+    });
+    return p;
+  }
+
+  /** 候选阅读标签：浏览上下文里除渲染页外的 /web/reader/ 页面。 */
+  async function listCandidates() {
+    const out = [];
+    for (const p of context.pages()) {
+      if (p === rendererPage || p.isClosed()) continue;
+      const parsed = parseReaderUrl(p.url());
+      if (!parsed) continue;
+      const title = (await p.title().catch(() => '')) || parsed.bookId;
+      out.push({ title, url: parsed.url, bookId: parsed.bookId });
+    }
+    return out;
+  }
+
+  // ---------------- 周期上报：登录态与候选标签 ----------------
+
+  let lastAuth = null;
+  let lastCandidates = '';
+  async function pollState() {
     if (exiting) return;
-    const reader = findReaderPage();
-    if (reader) injectCss(reader).catch(() => {});
-  }, 3000);
-
-  // ---------------------------------------------------------------- 指令处理
-
-  /** 校验并返回指令目标标签（阅读页标签）。 */
-  function ensureReader() {
-    const target = targetPage();
-    if (target.isClosed()) throw new Error('阅读页已被关闭');
-    if (!isReaderUrl(target.url())) throw new Error(`当前不在微信读书阅读页（${target.url()}）`);
-    return target;
+    try {
+      const cookies = await context.cookies('https://weread.qq.com');
+      const loggedIn = cookies.some((c) => c.name === 'wr_vid' && c.value);
+      if (loggedIn !== lastAuth) {
+        lastAuth = loggedIn;
+        sendEvent('auth_changed', { loggedIn });
+      }
+    } catch {
+      /* context 关闭中 */
+    }
+    try {
+      const candidates = await listCandidates();
+      const key = JSON.stringify(candidates);
+      if (key !== lastCandidates) {
+        lastCandidates = key;
+        sendEvent('candidates_changed', { candidates });
+      }
+    } catch {
+      /* 忽略 */
+    }
   }
+  pollTimer = setInterval(pollState, 2000);
+  pollState().catch(() => {});
 
-  /** 截取目标标签视口 400×300 原始 PNG（截屏前保证净化 CSS 在场）。 */
-  async function capturePng(target) {
+  // ---------------- 指令处理 ----------------
+
+  /** 截取渲染页 400×300 设备画面（净化 CSS + 字体就绪 + 灰度拉伸）。 */
+  async function captureRenderer(blackPoint) {
+    const target = rendererPage;
+    if (!target || target.isClosed()) {
+      throw Object.assign(new Error('渲染页不存在或已关闭'), { code: 'no_renderer' });
+    }
     await injectCss(target);
     await settlePaint(target);
-    await target.evaluate(() => document.fonts.ready);
-    const raw = await target.screenshot({
-      type: 'png',
-      clip: CAPTURE_CLIP,
-    });
-    fs.writeFileSync(path.join(__dirname, '.last-capture-raw.png'), raw);
-    if (INK_BLACK_POINT === 0) return raw;
+    await target.evaluate(() => document.fonts.ready).catch(() => {});
+    const raw = await target.screenshot({ type: 'png', clip: CAPTURE_CLIP });
+    if (!blackPoint) return raw;
     const enhanced = await target.evaluate(enhanceInk, {
-      pngB64: raw.toString('base64'), blackPoint: INK_BLACK_POINT, whitePoint: 250,
+      pngB64: raw.toString('base64'),
+      blackPoint,
+      whitePoint: 250,
     });
     return Buffer.from(enhanced, 'base64');
   }
 
-  /** 发送翻页键 → 等待重绘稳定 → 截屏。 */
-  async function pressAndCapture(key) {
-    const target = ensureReader();
+  async function pressAndCapture(key, delayMs, blackPoint) {
+    const target = rendererPage;
+    if (!target || target.isClosed()) {
+      throw Object.assign(new Error('渲染页不存在或已关闭'), { code: 'no_renderer' });
+    }
     await target.keyboard.press(key);
-    await target.waitForTimeout(DELAY_MS);
-    return capturePng(target);
+    await target.waitForTimeout(delayMs);
+    return captureRenderer(blackPoint);
   }
 
   const handlers = {
-    CAPTURE: async () => capturePng(ensureReader()),
-    NEXT_PAGE: () => pressAndCapture('ArrowRight'),
-    PREV_PAGE: () => pressAndCapture('ArrowLeft'),
-    /** 确认键：强制重写净化 CSS 后刷新当前页画面（不再自动触发 resize，避免白屏）。 */
-    REFRESH: async () => {
-      const target = ensureReader();
+    /** 打开/聚焦书架浏览页。 */
+    async OPEN_LIBRARY() {
+      if (!browsePage || browsePage.isClosed()) {
+        browsePage = await context.newPage();
+        await browsePage.setViewportSize(BROWSE_VIEWPORT).catch(() => {});
+      }
+      await browsePage.bringToFront().catch(() => {});
+      if (!/weread\.qq\.com/.test(browsePage.url())) {
+        await browsePage
+          .goto(START_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+          .catch(() => {});
+      }
+      return { kind: 'status', url: browsePage.url() };
+    },
+
+    /** 列出候选阅读标签（含书名与 URL）。 */
+    async LIST_CANDIDATES() {
+      return { kind: 'status', candidates: await listCandidates() };
+    },
+
+    /**
+     * 在渲染页加载指定书籍并返回首帧。失败时尽量恢复旧渲染页，
+     * 不把旧书画面当作新书首帧返回。
+     */
+    async LOAD_BOOK(payload) {
+      const parsed = parseReaderUrl(payload && payload.url);
+      if (!parsed) {
+        throw Object.assign(new Error('非法阅读 URL：必须是 https://weread.qq.com/web/reader/<书籍ID>'), {
+          code: 'invalid_url',
+          recoverable: false,
+        });
+      }
+      const previousUrl =
+        rendererPage && !rendererPage.isClosed() ? rendererPage.url() : null;
+      const target = ensureRenderer() || (rendererPage = await createRenderer());
+      try {
+        await target.goto(parsed.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      } catch (e) {
+        // 导航失败：恢复旧书（若有），新书未加载成功。
+        if (previousUrl && parseReaderUrl(previousUrl)) {
+          await target.goto(previousUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+        }
+        throw Object.assign(new Error('打开书籍失败：' + (e && e.message ? e.message : e)), {
+          code: 'navigation_failed',
+        });
+      }
       await injectCss(target, true);
-      await waitForContent(target, 3000);
-      await reportDiagnostics(target);
-      await settlePaint(target);
-      return capturePng(target);
+      const ready = await waitForContent(target, 15000);
+      if (!ready) {
+        if (previousUrl && parseReaderUrl(previousUrl)) {
+          sendLog('新书内容渲染超时，恢复上一本书');
+          await target.goto(previousUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+        }
+        throw Object.assign(new Error('书籍内容渲染超时'), { code: 'content_timeout' });
+      }
+      const buf = await captureRenderer(BLACK_POINT);
+      archiveCapture(buf);
+      return { kind: 'frame', pngB64: buf.toString('base64') };
+    },
+
+    async CAPTURE(payload) {
+      const buf = await captureRenderer(numberOr(payload && payload.blackPoint, BLACK_POINT));
+      archiveCapture(buf);
+      return { kind: 'frame', pngB64: buf.toString('base64') };
+    },
+
+    async NEXT_PAGE(payload) {
+      const buf = await pressAndCapture(
+        'ArrowRight',
+        numberOr(payload && payload.delayMs, DELAY_MS),
+        numberOr(payload && payload.blackPoint, BLACK_POINT)
+      );
+      archiveCapture(buf);
+      return { kind: 'frame', pngB64: buf.toString('base64') };
+    },
+
+    async PREV_PAGE(payload) {
+      const buf = await pressAndCapture(
+        'ArrowLeft',
+        numberOr(payload && payload.delayMs, DELAY_MS),
+        numberOr(payload && payload.blackPoint, BLACK_POINT)
+      );
+      archiveCapture(buf);
+      return { kind: 'frame', pngB64: buf.toString('base64') };
+    },
+
+    /** 确认键：强制重写净化 CSS 并刷新当前渲染页画面。 */
+    async REFRESH(payload) {
+      const target = rendererPage;
+      if (!target || target.isClosed()) {
+        throw Object.assign(new Error('渲染页不存在或已关闭'), { code: 'no_renderer' });
+      }
+      await injectCss(target, true);
+      await waitForContent(target, 5000);
+      if (DIAG) {
+        sendLog('刷新诊断：viewport=' + RENDERER_VIEWPORT.width + 'x' + RENDERER_VIEWPORT.height);
+      }
+      const buf = await captureRenderer(numberOr(payload && payload.blackPoint, BLACK_POINT));
+      archiveCapture(buf);
+      return { kind: 'frame', pngB64: buf.toString('base64') };
+    },
+
+    /** 关闭渲染页（浏览页保留，服务不退出）。 */
+    async CLOSE_RENDERER() {
+      if (rendererPage && !rendererPage.isClosed()) {
+        await rendererPage.close().catch(() => {});
+      }
+      rendererPage = null;
+      return { kind: 'ack' };
     },
   };
 
-  // 指令串行化，避免并发截图互相干扰。
+  function numberOr(v, fallback) {
+    return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback;
+  }
+
+  // 指令串行化：同一时刻只执行一条页面操作。
   let chain = Promise.resolve();
   function enqueue(job) {
     const p = chain.then(job);
@@ -529,8 +579,9 @@ async function main() {
     return p;
   }
 
-  // 立即挂载 stdin 指令监听：ready 之前收到的指令会得到结构化错误响应，
-  // 而不是被静默丢弃。
+  const DEFAULT_TIMEOUT_MS = 30000;
+  const TIMEOUTS_MS = { LOAD_BOOK: 60000 };
+
   const rl = readline.createInterface({ input: process.stdin });
   rl.on('line', (line) => {
     line = line.trim();
@@ -544,68 +595,55 @@ async function main() {
     }
     if (!msg || typeof msg.id !== 'number' || typeof msg.cmd !== 'string') return;
     enqueue(async () => {
-      // 看门狗：任何指令超过 25s 视为卡死，返回明确错误而非让 Rust 侧静默超时。
+      // 看门狗：超时返回结构化错误；完成时清理定时器，不泄漏。
+      let watchdogTimer = null;
       const watchdog = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`指令 ${msg.cmd} 执行超过 25s，已中止（页面可能失去响应）`)), 25000);
+        watchdogTimer = setTimeout(
+          () =>
+            reject(
+              Object.assign(new Error(`指令 ${msg.cmd} 执行超时，已中止`), {
+                code: 'command_timeout',
+              })
+            ),
+          TIMEOUTS_MS[msg.cmd] || DEFAULT_TIMEOUT_MS
+        );
       });
       try {
         const handler = handlers[msg.cmd];
-        if (!handler) throw new Error(`未知指令：${msg.cmd}`);
-        const buf = await Promise.race([handler(), watchdog]);
-        archiveCapture(buf);
-        sendReply(msg.id, true, { pngB64: buf.toString('base64') });
+        if (!handler) {
+          throw Object.assign(new Error(`未知指令：${msg.cmd}`), {
+            code: 'unknown_command',
+            recoverable: false,
+          });
+        }
+        const result = await Promise.race([handler(msg.payload || {}), watchdog]);
+        sendOk(msg.id, result);
       } catch (e) {
-        sendLog(`指令 ${msg.cmd} 失败：${e && e.message ? e.message : e}`);
-        sendReply(msg.id, false, { error: e && e.message ? e.message : String(e) });
+        clearTimeout(watchdogTimer);
+        sendErr(
+          msg.id,
+          e.code || 'internal',
+          e && e.message ? e.message : String(e),
+          e.recoverable !== false
+        );
+        return;
       }
+      clearTimeout(watchdogTimer);
     });
   });
 
   // Rust 端退出（stdin 关闭）→ 优雅关闭浏览器。
   rl.on('close', () => shutdown('stdin-closed'));
 
-  // 等待用户进入正文阅读页（首次运行需扫码登录，耗时较长）。
-  // 微信读书可能在新标签页打开正文：轮询扫描所有标签，命中后自动切换。
-  const readyTimeoutMin = Math.round(READY_TIMEOUT_MS / 60000);
-  sendLog('请在浏览器窗口中完成：1) 扫码登录微信读书；2) 打开任意书籍进入正文阅读页。等待中…');
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const deadline = Date.now() + READY_TIMEOUT_MS;
-  let lastLoggedUrl = '';
-  while (true) {
-    const reader = findReaderPage();
-    if (reader) {
-      page = reader;
-      break;
-    }
-    const current = !page.isClosed() ? page.url() : '（标签已关闭）';
-    if (current !== lastLoggedUrl) {
-      lastLoggedUrl = current;
-      sendLog(`当前页面：${current}（仍在等待正文阅读页…）`);
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`等待进入微信读书正文页超时（${readyTimeoutMin} 分钟），请重新运行并完成扫码登录`);
-    }
-    await sleep(800);
-  }
-  await page.bringToFront().catch(() => {});
-  await injectCss(page);
-  // 等待阅读内容真实渲染完成，避免把白屏推给设备。
-  sendLog('正在等待阅读内容渲染…');
-  await waitForContent(page);
-  await reportDiagnostics(page);
-
-  // 记录本次阅读页，供下次启动自动续读。
-  try {
-    fs.writeFileSync(LAST_READER_FILE, page.url());
-  } catch {
-    /* 记录失败不影响运行 */
-  }
-  sendEvent('ready', { url: page.url() });
-  sendLog('控制器已就绪：净化 CSS 已注入，开始接受翻页 / 截屏指令。');
+  // 启动即就绪：登录、选书均由管理页/浏览页流程完成，不作为就绪条件。
+  sendEvent('controller_ready', {
+    browserMode: BROWSER_MODE,
+    profile: PROFILE_DIR,
+    rendererViewport: RENDERER_VIEWPORT,
+  });
 }
 
 main().catch((e) => {
-  // 主动关闭（信号 / 关窗 / stdin 结束）期间抛出的异常不算启动失败。
   if (shuttingDown) {
     process.exit(0);
   }
